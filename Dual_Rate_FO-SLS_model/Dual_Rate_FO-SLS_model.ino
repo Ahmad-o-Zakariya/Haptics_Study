@@ -7,28 +7,26 @@ const int DIR_PIN = 4;
 const int CURRENT_SEN_PIN = A0;
 
 // Hardware Portability Configurations
-const bool INVERT_MOTOR_DIRECTION = false; // Set to true/false based on encoder phase alignment
+const bool INVERT_MOTOR_DIRECTION = false; 
 
 // Electromechanical Transformation Constants
-const float INTERACTION_RADIUS = 0.001275f; // 2.55mm shaft radius (Meters)
-const float MOTOR_KT = 0.020f;              // Nominal RS-555 Torque Constant (N-m/A)
+const float INTERACTION_RADIUS = 0.001275f; 
+const float MOTOR_KT = 0.020f;              
 const float FORCE_TO_CURRENT = INTERACTION_RADIUS / MOTOR_KT; 
 
 // ACS712 Current Sensing Architecture
 const float ADC_VCC = 5.000f;
 const float ADC_RESOLUTION = 1023.0f;
-const float SENSITIVITY = 0.100f;           // 100mV/A
-float zero_voltage_baseline = 2.5113f;      // Self-calibrating in setup()
+const float SENSITIVITY = 0.100f;           
+float zero_voltage_baseline = 2.5113f;      
 
-// Configurable Current Sensor Filter Coefficient
-// Options: 0.05 (Heavy filter/high lag) to 0.20 (Light filter/low lag). Default: 0.15
 const float CONFIGURABLE_BETA = 0.15f; 
 float filteredCurrent = 0.0f;
 
-// Dual-Tier Current Safety Thresholds
-const float I_SAFE_LIMIT = 3.0f;           // High transient current limit for rigid wall feel
-const float I_CONTINUOUS_MAX = 1.50f;       // Continuous thermal limit of motor winding
-const unsigned long OVERCURRENT_TIMEOUT_MS = 350; // Max allowed duration for transient spikes
+// Safety Limits
+const float I_SAFE_LIMIT = 3.0f;           
+const float I_CONTINUOUS_MAX = 1.50f;       
+const unsigned long OVERCURRENT_TIMEOUT_MS = 350; 
 unsigned long overcurrentTimer = 0;
 bool overcurrentActive = false;
 bool systemKilled = false;
@@ -37,13 +35,20 @@ bool systemKilled = false;
 const float Kp_curr = 45.0f;                
 const float Ki_curr = 180.0f;               
 float currentIntegralError = 0.0f;          
-const float TS = 0.001f;                    // 1ms Sampling Interval
+const float TS_FAST = 0.0005f;               // Fast Loop Period: 1ms (1000 Hz)
 
-// FO-SLS Model System Parameters (2026 Reference Specs)
+// ==========================================
+// DUAL-RATE STRUCTURAL CONFIGURATIONS (Paper 1 & 2)
+// ==========================================
+const int N_RATIO = 5;                      // Down-sampling multiplier ratio (N)
+const float TS_SLOW = TS_FAST * N_RATIO;    // Slow Loop Period: 5ms (200 Hz)
+int slowLoopCounter = 0;
+
+// FO-SLS Model System Parameters 
 const float K_0 = 2.89f;
 const float K_1 = 5.70f;
 const float B_1 = 5.89f;
-const float ALPHA = 0.5f;
+const float ALPHA = 0.7f;                   // Sweep from 0.1 to 1.0 to generate your graph
 
 // Memory Buffers for Fractional Calculus (N = 101)
 const int N_MEM = 101;
@@ -52,16 +57,17 @@ float forceHistory[N_MEM];
 float glWeights[N_MEM];
 int bufferIndex = 0;
 
-// Precomputed Model Constants
+// Precomputed Model Constants (Scaled for TS_SLOW)
 float C_e0 = 0.0f;
 float C_ehist = 0.0f;
 float C_fhist = 0.0f;
+float F_slow_memory = 0.0f;                 // Zero-Order Hold register for slow loop forces
 
-// Integer Encoder Space Configurations
+// Encoder Configurations
 volatile long encoderPos = 0;
 volatile int lastEncoded = 0;
-const long WALL_POSITION_COUNTS = 400;     // Virtual Wall boundary location
-const float COUNTS_TO_DISPLACEMENT = 0.5f; // Scaling factor for model inputs
+const long WALL_POSITION_COUNTS = 400;     
+const float COUNTS_TO_DISPLACEMENT = 0.5f; 
 
 PwmOut pwm_pin5(5);
 unsigned long lastLoopTime = 0;
@@ -74,7 +80,9 @@ void precomputeConstants() {
   for (int j = 1; j < N_MEM; j++) {
     glWeights[j] = glWeights[j - 1] * (1.0f - ((ALPHA + 1.0f) / (float)j));
   }
-  float Ts_alpha = pow(TS, ALPHA);
+  
+  // Base scaling calculation driven entirely by the slow-rate period (TS_SLOW)
+  float Ts_alpha = pow(TS_SLOW, ALPHA);
   float tau_alpha = B_1 / K_1;
   float B_dyn = B_1 * (1.0f + (K_0 / K_1));
   float denom = 1.0f + (tau_alpha / Ts_alpha);
@@ -84,17 +92,6 @@ void precomputeConstants() {
   C_fhist = (tau_alpha / Ts_alpha) / denom;
 }
 
-// void emergencyShutdown(const char* reason) {
-//   systemKilled = true;
-//   pwm_pin5.pulse_perc(0.0f);
-//   digitalWrite(DIR_PIN, LOW);
-//   while(true) {
-//     Serial.print(F("EMERGENCY SHUTDOWN: "));
-//     Serial.println(reason);
-//     delay(1000);
-//   }
-// }
-
 void setup() {
   Serial.begin(115200);
   
@@ -103,23 +100,20 @@ void setup() {
   pinMode(DT_PIN, INPUT_PULLUP);
   pinMode(CURRENT_SEN_PIN, INPUT);
 
-  // Clear memory history rings
   for(int i = 0; i < N_MEM; i++) {
     errorHistory[i] = 0.0f;
     forceHistory[i] = 0.0f;
   }
 
-  // Bind Quadrature Interrupt Lines
   int MSB = digitalRead(CLK_PIN);
   int LSB = digitalRead(DT_PIN);
   lastEncoded = (MSB << 1) | LSB;
   attachInterrupt(digitalPinToInterrupt(CLK_PIN), updateEncoderStandard, CHANGE);
   attachInterrupt(digitalPinToInterrupt(DT_PIN), updateEncoderStandard, CHANGE);
 
-  pwm_pin5.begin(20000.0f, 0.0f); // 20 kHz Ultrasonic switching frequency
+  pwm_pin5.begin(20000.0f, 0.0f); 
   pwm_pin5.pulse_perc(0.0f);
 
-  // Self-Calibration: Compute stable zero-current baseline offset
   long zeroSum = 0;
   for(int i = 0; i < 1000; i++) {
     zeroSum += analogRead(CURRENT_SEN_PIN);
@@ -129,119 +123,109 @@ void setup() {
 
   precomputeConstants();
   
-  // Establish baseline tracking time for deterministic scheduling
   lastLoopTime = micros();
-  Serial.println(F("# FO-SLS CURRENT CONTROL ENVIRONMENT INITIALIZED"));
-  Serial.println(F("# Columns: Pos,Penetration,F_Th,F_Ren,I_Targ,I_Meas,I_Err,PWM"));
+  Serial.println(F("# DUAL-RATE FO-SLS ENVIRONMENT INITIALIZED"));
+  Serial.println(F("# Columns: Pos,Penetration,F_Th,F_Ren,I_Targ,I_Meas,Alpha"));
 }
 
 void loop() {
   if (systemKilled) return;
 
-  // Jitter-Free Deterministic Execution Engine (Strict 1000 Hz timeline)
-  while (micros() - lastLoopTime < 1000) { ; }
-  lastLoopTime += 1000; 
+  // Jitter-Free Deterministic Execution Engine (Strict 1000 Hz Fast Loop Timeline)
+  while (micros() - lastLoopTime < 500) { ; }
+  lastLoopTime += 500; 
 
-  // 1. Thread-Safe Quadrature Sample Fetch
+  // 1. Thread-Safe Encoder Sample
   noInterrupts();
   long currentRawPos = encoderPos;
   interrupts();
 
-  // 2. Integer Penetration Displacement Evaluation (e_k)
+  // 2. Compute Instantaneous Penetration Error (e_k)
   float e_k = 0.0f;
   if (currentRawPos > WALL_POSITION_COUNTS) {
     e_k = (float)(currentRawPos - WALL_POSITION_COUNTS) * COUNTS_TO_DISPLACEMENT;
   }
   float functionalPenetration = (currentRawPos > WALL_POSITION_COUNTS) ? (float)(currentRawPos - WALL_POSITION_COUNTS) : 0.0f;
 
-  // 3. Grünwald-Letnikov Convolution Memory Processing
-  float sum_e = 0.0f;
-  float sum_f = 0.0f;
-  for (int j = 1; j < N_MEM; j++) {
-    int fetchIndex = (bufferIndex - j + N_MEM) % N_MEM;
-    sum_e += glWeights[j] * errorHistory[fetchIndex];
-    sum_f += glWeights[j] * forceHistory[fetchIndex];
+  // ==========================================
+  // CRITICAL SUB-SYSTEM: DECOUPLED DUAL-RATE ENGINE
+  // ==========================================
+  slowLoopCounter++;
+  if (slowLoopCounter >= N_RATIO) {
+    // Execute heavy Grünwald-Letnikov memory summary operations at the slower rate (TS_SLOW)
+    float sum_e = 0.0f;
+    float sum_f = 0.0f;
+    for (int j = 1; j < N_MEM; j++) {
+      int fetchIndex = (bufferIndex - j + N_MEM) % N_MEM;
+      sum_e += glWeights[j] * errorHistory[fetchIndex];
+      sum_f += glWeights[j] * forceHistory[fetchIndex];
+    }
+
+    // Compute the slow viscoelastic force contribution
+    F_slow_memory = (C_ehist * sum_e) - (C_fhist * sum_f);
+
+    // Commit current values to the ring buffers at the slow clock tick
+    errorHistory[bufferIndex] = e_k;
+    // Store the baseline slow unconstrained theoretical model force
+    forceHistory[bufferIndex] = (C_e0 * e_k) + F_slow_memory; 
+    
+    bufferIndex = (bufferIndex + 1) % N_MEM;
+    slowLoopCounter = 0; // Reset down-sampling counter
   }
 
-  // 4. Calculate Core FO-SLS Mathematical System Force Response
-  float F_theoretical = ((C_e0 * e_k) + (C_ehist * sum_e) - (C_fhist * sum_f));
+  // 3. Fast Loop Synthesis: Instantaneous Spring + Latched Memory Force
+  float F_theoretical = (C_e0 * e_k) + F_slow_memory;
   
-  // Unilateral Wall Evaluation Block
   float F_rendered = F_theoretical;
   if (F_rendered < 0.0f) F_rendered = 0.0f; 
 
-  // Update Ring Arrays (Always store unconstrained F_theoretical per paper protocol)
-  errorHistory[bufferIndex] = e_k;
-  forceHistory[bufferIndex] = F_theoretical; 
-  bufferIndex = (bufferIndex + 1) % N_MEM;
-
-  // 5. Convert Rendered Target Force to Electrical Current Demand
+  // 4. Force to Current Converters
   float targetCurrent = F_rendered * FORCE_TO_CURRENT;
   targetCurrent = constrain(targetCurrent, 0.0f, I_SAFE_LIMIT); 
 
-  // 6. 8-Sample ADC Oversampling Loop
+  // 5. ADC Acquisition and Filtration
   long adcAccumulator = 0;
   for(int s = 0; s < 8; s++) {
     adcAccumulator += analogRead(CURRENT_SEN_PIN);
   }
   float averagedADC = (float)adcAccumulator / 8.0f;
-  
-  // Apply Configurable Exponential Moving Average Filter
   float voltage = (averagedADC / ADC_RESOLUTION) * ADC_VCC;
   float rawCurrent = (voltage - zero_voltage_baseline) / SENSITIVITY;
   filteredCurrent = (CONFIGURABLE_BETA * rawCurrent) + ((1.0f - CONFIGURABLE_BETA) * filteredCurrent);
   float continuousCurrentMagnitude = abs(filteredCurrent);
 
-  // 7. Dual-Tier Safety Monitor Evaluation
-  if (continuousCurrentMagnitude > I_CONTINUOUS_MAX) {
-    if (!overcurrentActive) {
-      overcurrentTimer = millis();
-      overcurrentActive = true;
-    }//  else if (millis() - overcurrentTimer > OVERCURRENT_TIMEOUT_MS) {
-    //   emergencyShutdown("SUSTAINED MOTOR OVERCURRENT THERMAL FAULT");
-    // }
-  } else {
-    overcurrentActive = false;
-  }
-
-  // 8. Closed-Loop PI Engine with Conditional Integration Anti-Windup
+  // 6. PI Engine with Conditional Integration Anti-Windup
   float currentError = targetCurrent - continuousCurrentMagnitude;
-  
-  // Calculate potential proportional and integral efforts
   float pEffort = Kp_curr * currentError;
-  float potentialIntegral = currentIntegralError + (currentError * TS);
+  float potentialIntegral = currentIntegralError + (currentError * TS_FAST);
   float iEffort = Ki_curr * potentialIntegral;
   float potentialControlEffort = pEffort + iEffort;
 
-  // Anti-Windup Logic: Only accumulate if output is not saturated OR if error reduces saturation
   if ((potentialControlEffort >= 0.0f && potentialControlEffort <= 255.0f) || 
       (potentialControlEffort > 255.0f && currentError < 0.0f) || 
       (potentialControlEffort < 0.0f && currentError > 0.0f)) {
     currentIntegralError = potentialIntegral;
   }
-  
   float controlEffort = pEffort + (Ki_curr * currentIntegralError);
 
-  // 9. Normalized PWM Duty Actuation Block
+  // 7. PWM Motor Driver Actuation Output
   float dutyCycle = controlEffort / 255.0f;
   dutyCycle = constrain(dutyCycle, 0.0f, 1.0f);
   int rawPwmOut = (int)(dutyCycle * 255.0f);
 
   if (targetCurrent > 0.005f) {
-    bool dirState = LOW; // Standard baseline configuration direction
+    bool dirState = LOW; 
     if (INVERT_MOTOR_DIRECTION) dirState = !dirState;
-    
     digitalWrite(DIR_PIN, dirState);
     pwm_pin5.pulse_perc(dutyCycle * 100.0f);
   } else {
     pwm_pin5.pulse_perc(0.0f);
-    currentIntegralError = 0.0f; // Flush error accumulator when outside the wall
+    currentIntegralError = 0.0f; 
   }
 
-  // 10. Python-Ready CSV Telemetry Logger (Executes at 40 Hz frequency scaling)
+  // 8. Python Data Logger Telemetry
   telemetryCounter++;
   if (telemetryCounter >= 25) {
-    // Prefix '$DAT,' simplifies filtering out boot descriptions during parsing
     Serial.print(F("$DAT,"));
     Serial.print(currentRawPos);             Serial.print(F(","));
     Serial.print(functionalPenetration, 1);   Serial.print(F(","));
@@ -249,8 +233,8 @@ void loop() {
     Serial.print(F_rendered, 3);             Serial.print(F(","));
     Serial.print(targetCurrent, 3);          Serial.print(F(","));
     Serial.print(continuousCurrentMagnitude, 3); Serial.print(F(","));
-    Serial.print(currentError, 3);           Serial.print(F(","));
-    Serial.println(rawPwmOut);
+    Serial.print(ALPHA, 2);
+    Serial.println();
     telemetryCounter = 0;
   }
 }
