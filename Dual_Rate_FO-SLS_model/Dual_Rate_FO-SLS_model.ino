@@ -24,7 +24,7 @@ const float CONFIGURABLE_BETA = 0.15f;
 float filteredCurrent = 0.0f;
 
 // Safety Limits
-const float I_SAFE_LIMIT = 3.0f;           
+const float I_SAFE_LIMIT = 5.0f;           
 const float I_CONTINUOUS_MAX = 1.50f;       
 const unsigned long OVERCURRENT_TIMEOUT_MS = 350; 
 unsigned long overcurrentTimer = 0;
@@ -35,20 +35,20 @@ bool systemKilled = false;
 const float Kp_curr = 45.0f;                
 const float Ki_curr = 180.0f;               
 float currentIntegralError = 0.0f;          
-const float TS_FAST = 0.0005f;               // Fast Loop Period: 1ms (1000 Hz)
+const float TS_FAST = 0.0005f;               // Fast Loop Period: 0.5ms (2000 Hz)
 
 // ==========================================
 // DUAL-RATE STRUCTURAL CONFIGURATIONS (Paper 1 & 2)
 // ==========================================
-const int N_RATIO = 5;                      // Down-sampling multiplier ratio (N)
-const float TS_SLOW = TS_FAST * N_RATIO;    // Slow Loop Period: 5ms (200 Hz)
+const int N_RATIO = 4;                      // Down-sampling multiplier ratio (N)
+const float TS_SLOW = TS_FAST * N_RATIO;    
 int slowLoopCounter = 0;
 
 // FO-SLS Model System Parameters 
 const float K_0 = 2.89f;
-const float K_1 = 5.70f;
-const float B_1 = 5.89f;
-const float ALPHA = 0.7f;                   // Sweep from 0.1 to 1.0 to generate your graph
+const float K_1 = 10.0f;
+const float B_1 = 1.0f;
+const float ALPHA = 1.0f;                   // Sweep from 0.1 to 1.0 to generate your graph
 
 // Memory Buffers for Fractional Calculus (N = 101)
 const int N_MEM = 101;
